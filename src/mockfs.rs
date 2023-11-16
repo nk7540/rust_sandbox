@@ -17,7 +17,7 @@ use std::sync::RwLock;
 type FileDescriptor = c_int;
 
 #[derive(Debug, Clone)]
-enum FileType {
+pub enum FileType {
     Regular(String),                      // Contains file content
     Directory(HashMap<String, FileType>), // A map of file names to file types
     Symlink(String),                      // Contains the target path
@@ -34,8 +34,7 @@ lazy_static! {
                 let mut src_dir = HashMap::new();
                 src_dir.insert("credentials".to_string(), FileType::Regular("credentials content".to_string()));
                 src_dir.insert("noncredential".to_string(), FileType::Regular("noncredential content".to_string()));
-                src_dir.insert("noncredential2".to_string(), FileType::Regular("noncredential2 content".to_string()));
-                src_dir.insert("symlink".to_string(), FileType::Symlink("/home/cs_gakusei/work/rust_sandbox/src/credentials".to_string()));
+                src_dir.insert("symlink".to_string(), FileType::Symlink("/home/cs_gakusei/work/rust_sandbox/src/noncredential".to_string()));
                 src_dir
             }),
         );
@@ -69,31 +68,37 @@ pub unsafe fn open(path: *const c_char, oflag: c_int) -> c_int {
 
 pub unsafe fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
     let path = CStr::from_ptr(pathname).to_str().unwrap_or("");
-    let path = convert_relative_to_absolute_path(path);
-    let components: Vec<&str> = path.split('/').filter(|&c| !c.is_empty()).collect();
-
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|&c| !c.is_empty() && c != ".")
+        .collect();
     let fs_tree_lock = FS_TREE.read().unwrap();
-    let fs_tree = if dirfd == libc::AT_FDCWD {
-        &*fs_tree_lock // If dirfd is AT_FDCWD, we use the root of the FS tree.
-    } else if let Some(dir_path) = OPEN_FILES.read().unwrap().get(&dirfd) {
-        // Here we assume that dirfd is a directory.
-        // In a real file system, you would check that dirfd is indeed a directory.
-        if let Some(FileType::Directory(contents)) = fs_tree_lock.get(dir_path) {
-            contents
-        } else {
-            return -1;
-        }
-    } else {
-        return -1; // Invalid dirfd
-    };
+    let open_files_lock = OPEN_FILES.read().unwrap();
+    let current_dir = CURRENT_DIR.read().unwrap();
 
-    if let Some(file_type) = traverse_path(&fs_tree, &components) {
+    let base_path = if path.starts_with("/") {
+        "".to_string()
+    } else if dirfd == libc::AT_FDCWD {
+        current_dir.to_string()
+    } else if let Some(dir_path) = open_files_lock.get(&dirfd) {
+        dir_path.clone()
+    } else {
+        return -1;
+    };
+    let mut full_components: Vec<_> = base_path.split('/').filter(|&c| !c.is_empty()).collect();
+    full_components.extend(components);
+
+    if traverse_path(&fs_tree_lock, &full_components).is_some() {
         let mut fd = NEXT_FD.write().unwrap();
         let new_fd = *fd;
         *fd += 1;
-        drop(fs_tree); // Drop the read lock before calling register_fd_in_proc
-        register_fd_in_proc(path.as_str(), new_fd);
-        OPEN_FILES.write().unwrap().insert(new_fd, path.to_string());
+        drop(fs_tree_lock);
+        register_fd_in_proc(format!("/{}", full_components.join("/")).as_str(), new_fd);
+        drop(open_files_lock);
+        OPEN_FILES
+            .write()
+            .unwrap()
+            .insert(new_fd, format!("/{}", full_components.join("/")));
         new_fd
     } else {
         -1
@@ -107,24 +112,28 @@ pub unsafe fn readlinkat(
     bufsz: usize,
 ) -> isize {
     let path = CStr::from_ptr(pathname).to_str().unwrap_or("");
+    let components: Vec<&str> = path.split('/').filter(|&c| !c.is_empty()).collect();
     let fs_tree_lock = FS_TREE.read().unwrap();
+    let open_files_lock = OPEN_FILES.read().unwrap();
 
-    // Resolve the starting point in the filesystem based on dirfd
-    let fs_tree = if dirfd == libc::AT_FDCWD {
-        &*fs_tree_lock // Use the root of the filesystem tree if dirfd is AT_FDCWD
-    } else if let Some(dir_path) = OPEN_FILES.read().unwrap().get(&dirfd) {
-        // If dirfd is a valid directory file descriptor, find the directory in the filesystem tree
-        if let Some(FileType::Directory(contents)) = fs_tree_lock.get(dir_path) {
-            contents
-        } else {
-            return -1; // dirfd is not a directory
-        }
+    // Determine the starting point in the filesystem based on dirfd
+    let full_path: Vec<&str> = if dirfd == libc::AT_FDCWD {
+        components
     } else {
-        return -1; // Invalid dirfd
+        // We need to keep the lock guard in scope
+        if let Some(dir_path) = open_files_lock.get(&dirfd) {
+            // Combine the directory path with the provided pathname
+            let mut base_path: Vec<&str> = dir_path.split('/').filter(|&c| !c.is_empty()).collect();
+            base_path.extend(components);
+            base_path
+        } else {
+            // Invalid dirfd
+            return -1;
+        }
     };
 
     // Resolve the symlink path within the filesystem tree starting from fs_tree
-    if let Some(FileType::Symlink(target_path)) = fs_tree.get(path) {
+    if let Some(FileType::Symlink(target_path)) = traverse_path(&fs_tree_lock, &full_path) {
         let bytes_to_copy = target_path.as_bytes().len().min(bufsz);
         for (i, byte) in target_path.as_bytes()[..bytes_to_copy].iter().enumerate() {
             *buf.add(i) = *byte as c_char;
@@ -167,52 +176,66 @@ pub fn create(path: &str, file_type: FileType) -> Result<(), &'static str> {
     if components.is_empty() {
         return Err("Invalid path");
     }
-
     // Handle absolute paths
     if path.starts_with('/') {
         components.remove(0);
     }
 
-    let mut fs_tree = FS_TREE.write().unwrap();
+    let mut fs_tree_guard = FS_TREE.write().unwrap();
 
-    let mut current_path = String::new();
+    // Initialize `sub_tree` as a mutable reference to `FS_TREE`.
+    let mut sub_tree = &mut *fs_tree_guard;
+
     for component in components.iter().take(components.len() - 1) {
-        current_path.push('/');
-        current_path.push_str(component);
-
-        let entry = fs_tree
-            .entry(current_path.clone())
-            .or_insert_with(|| FileType::Directory(HashMap::new()));
-        if let FileType::Directory(ref mut subdir) = entry {
-            // This now correctly references the subdir HashMap.
-            // No need to create a new RwLock.
-            fs_tree = subdir;
-        } else {
-            // The path component exists and is not a directory
-            return Err("Path component is not a directory");
-        }
+        // This will create a new directory if it doesn't exist
+        sub_tree = sub_tree
+            .entry(component.to_string())
+            .or_insert_with(|| FileType::Directory(HashMap::new()))
+            .as_directory_mut()?; // Convert to &mut HashMap or return an error if not a directory
     }
 
-    // Now `fs_tree` is the parent directory of the file we want to create
+    // Insert the file or symlink at the appropriate place in the tree
     let name = components.last().unwrap();
-    current_path.push('/');
-    current_path.push_str(name);
-
-    if fs_tree.contains_key(&current_path) {
-        // The file already exists
+    if sub_tree.contains_key(*name) {
         Err("File already exists")
     } else {
-        fs_tree.insert(current_path, file_type);
+        sub_tree.insert(name.to_string(), file_type);
         Ok(())
+    }
+}
+
+trait AsDirectoryMut {
+    fn as_directory_mut(&mut self) -> Result<&mut HashMap<String, FileType>, &'static str>;
+}
+
+impl AsDirectoryMut for FileType {
+    fn as_directory_mut(&mut self) -> Result<&mut HashMap<String, FileType>, &'static str> {
+        match self {
+            FileType::Directory(ref mut map) => Ok(map),
+            _ => Err("Not a directory"),
+        }
+    }
+}
+
+pub unsafe fn link(src: *const c_char, dst: *const c_char) -> c_int {
+    let src_str = CStr::from_ptr(src).to_str().unwrap();
+    let dst_str = CStr::from_ptr(dst).to_str().unwrap();
+
+    let fs_tree_lock = FS_TREE.read().unwrap();
+    if let Some(_) = traverse_path(&fs_tree_lock, &parse_path(src_str)) {
+        drop(fs_tree_lock);
+        match create(dst_str, FileType::Symlink(src_str.to_string())) {
+            Ok(_) => 0,   // Success
+            Err(_) => -1, // Failed to create symlink
+        }
+    } else {
+        -1 // Source path does not exist
     }
 }
 
 fn register_fd_in_proc(path: &str, fd: c_int) {
     let proc_entry = format!("/proc/self/fd/{}", fd);
-    let mut fs_tree = FS_TREE.write().unwrap();
-
-    // Inserting the fd as a symlink to the actual path in our mock /proc/self/fd
-    fs_tree.insert(proc_entry, FileType::Symlink(path.to_string()));
+    create(&proc_entry, FileType::Symlink(path.to_string()));
 }
 
 fn convert_relative_to_absolute_path(relative_path: &str) -> String {
@@ -240,6 +263,9 @@ fn traverse_path<'a>(
 ) -> Option<FileType> {
     let mut current = current_dir;
     for &component in components.iter() {
+        if component == "." {
+            continue;
+        }
         match current.get(component) {
             Some(FileType::Directory(ref subdir)) => {
                 current = subdir;
@@ -252,4 +278,8 @@ fn traverse_path<'a>(
         }
     }
     Some(FileType::Directory(current.clone()))
+}
+
+fn parse_path(path: &str) -> Vec<&str> {
+    path.split('/').filter(|&c| !c.is_empty()).collect()
 }
