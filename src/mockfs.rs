@@ -57,9 +57,9 @@ lazy_static! {
         );
         RwLock::new(m)
     };
-    static ref NEXT_FD: RwLock<FileDescriptor> = RwLock::new(3);  // start with 3
-    static ref OPEN_FILES: RwLock<HashMap<FileDescriptor, String>> = RwLock::new(HashMap::new());
-    static ref CURRENT_DIR: RwLock<String> = RwLock::new("/home/cs_gakusei/work/rust_sandbox".to_string());
+    static ref NEXT_FD: std::sync::RwLock<FileDescriptor> = std::sync::RwLock::new(3);  // start with 3
+    static ref OPEN_FILES: std::sync::RwLock<HashMap<FileDescriptor, String>> = std::sync::RwLock::new(HashMap::new());
+    static ref CURRENT_DIR: std::sync::RwLock<String> = std::sync::RwLock::new("/home/cs_gakusei/work/rust_sandbox".to_string());
 }
 
 pub unsafe fn open(path: *const c_char, oflag: c_int) -> c_int {
@@ -72,6 +72,7 @@ pub unsafe fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_i
         .split('/')
         .filter(|&c| !c.is_empty() && c != ".")
         .collect();
+    println!("openat({}): FS_TREE.read()", path);
     let fs_tree_lock = FS_TREE.read().unwrap();
     let open_files_lock = OPEN_FILES.read().unwrap();
     let current_dir = CURRENT_DIR.read().unwrap();
@@ -113,6 +114,7 @@ pub unsafe fn readlinkat(
 ) -> isize {
     let path = CStr::from_ptr(pathname).to_str().unwrap_or("");
     let components: Vec<&str> = path.split('/').filter(|&c| !c.is_empty()).collect();
+    println!("readlinkat({}): FS_TREE.read()", path);
     let fs_tree_lock = FS_TREE.read().unwrap();
     let open_files_lock = OPEN_FILES.read().unwrap();
 
@@ -181,6 +183,7 @@ pub fn create(path: &str, file_type: FileType) -> Result<(), &'static str> {
         components.remove(0);
     }
 
+    println!("create({}): FS_TREE.write()", path);
     let mut fs_tree_guard = FS_TREE.write().unwrap();
 
     // Initialize `sub_tree` as a mutable reference to `FS_TREE`.
@@ -217,10 +220,49 @@ impl AsDirectoryMut for FileType {
     }
 }
 
+// pub unsafe fn remove(filename: *const c_char) -> c_int {
+//     let path_str = CStr::from_ptr(filename).to_str().unwrap();
+//     let path_components = parse_path(path_str);
+//     let mut fs_tree_lock = FS_TREE.write().unwrap();
+
+//     if path_components.is_empty() {
+//         return -1; // Invalid path
+//     }
+
+//     let parent_path = if path_components.len() == 1 {
+//         vec![] // If the path has only one component, then its parent is the root.
+//     } else {
+//         path_components[..path_components.len() - 1].to_vec()
+//     };
+
+//     let file_name = path_components.last().unwrap();
+
+//     if let Some(FileType::Directory(ref mut parent_dir)) =
+//         traverse_path_mut(&mut fs_tree_lock, &parent_path)
+//     {
+//         match parent_dir.get(*file_name) {
+//             Some(FileType::Directory(contents)) if contents.is_empty() => {
+//                 // Only allow removal of empty directories
+//                 parent_dir.remove(*file_name);
+//                 0 // Successfully removed
+//             }
+//             Some(FileType::Regular(_)) | Some(FileType::Symlink(_)) => {
+//                 // Remove file or symlink
+//                 parent_dir.remove(*file_name);
+//                 0 // Successfully removed
+//             }
+//             _ => -1, // Directory not empty or file not found
+//         }
+//     } else {
+//         -1 // Parent directory not found
+//     }
+// }
+
 pub unsafe fn link(src: *const c_char, dst: *const c_char) -> c_int {
     let src_str = CStr::from_ptr(src).to_str().unwrap();
     let dst_str = CStr::from_ptr(dst).to_str().unwrap();
 
+    println!("link({}, {}): FS_TREE.read()", src_str, dst_str);
     let fs_tree_lock = FS_TREE.read().unwrap();
     if let Some(_) = traverse_path(&fs_tree_lock, &parse_path(src_str)) {
         drop(fs_tree_lock);
@@ -232,6 +274,27 @@ pub unsafe fn link(src: *const c_char, dst: *const c_char) -> c_int {
         -1 // Source path does not exist
     }
 }
+
+// pub unsafe fn unlink(path: *const c_char) -> c_int {
+//     let path_str = CStr::from_ptr(path).to_str().unwrap();
+//     let path_components = parse_path(path_str);
+//     let mut fs_tree_lock = FS_TREE.write().unwrap();
+
+//     let parent_path = path_components[..path_components.len() - 1].to_vec();
+//     let file_name = path_components.last().unwrap();
+
+//     if let Some(FileType::Directory(ref mut parent_dir)) =
+//         traverse_path_mut(&mut fs_tree_lock, &parent_path)
+//     {
+//         if parent_dir.remove(*file_name).is_some() {
+//             0 // Successfully removed
+//         } else {
+//             -1 // File not found
+//         }
+//     } else {
+//         -1 // Parent directory not found
+//     }
+// }
 
 fn register_fd_in_proc(path: &str, fd: c_int) {
     let proc_entry = format!("/proc/self/fd/{}", fd);
@@ -279,6 +342,26 @@ fn traverse_path<'a>(
     }
     Some(FileType::Directory(current.clone()))
 }
+
+// fn traverse_path_mut<'a>(
+//     current_dir: &'a mut HashMap<String, FileType>,
+//     components: &[&str],
+// ) -> Option<&'a mut FileType> {
+//     let mut current = current_dir;
+//     for &component in components {
+//         match current.get_mut(component) {
+//             Some(FileType::Directory(ref mut subdir)) => {
+//                 current = subdir;
+//             }
+//             Some(file_type) if &component == components.last().unwrap() => {
+//                 // Last component in path
+//                 return Some(file_type);
+//             }
+//             _ => return None,
+//         }
+//     }
+//     Some(&mut FileType::Directory(current.clone()))
+// }
 
 fn parse_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|&c| !c.is_empty()).collect()

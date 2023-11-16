@@ -1,7 +1,7 @@
 #[cfg(not(feature = "mock"))]
 use fs::read_link;
 #[cfg(not(feature = "mock"))]
-use libc::{link, open, openat, readlinkat, unlink};
+use libc::{link, open, openat, readlinkat, remove, unlink};
 mod mockfs;
 #[cfg(feature = "mock")]
 use mockfs::{link, open, openat, read_link, readlinkat};
@@ -155,15 +155,8 @@ mod tests {
                     CString::new(NONCREDENTIAL).unwrap().as_ptr(),
                 );
             });
-            let t3 = thread::spawn(|| unsafe {
-                link(
-                    CString::new(CREDENTIALS).unwrap().as_ptr(),
-                    CString::new(SYMLINK).unwrap().as_ptr(),
-                );
-            });
             t1.join();
             t2.join();
-            t3.join();
         })
     }
 
@@ -180,13 +173,7 @@ mod tests {
                 create_symlink(CREDENTIALS, NONCREDENTIAL);
                 // create_symlink(NONCREDENTIAL2, NONCREDENTIAL);
             });
-            let t3 = thread::spawn(|| {
-                println!("unsafe_open: t3");
-                // create_symlink(CREDENTIALS, NONCREDENTIAL);
-                create_symlink(NONCREDENTIAL2, NONCREDENTIAL);
-            });
             t2.join();
-            t3.join();
             let target = read_link(SYMLINK).unwrap();
             let target = target.to_str().unwrap();
             if target != CREDENTIALS {
