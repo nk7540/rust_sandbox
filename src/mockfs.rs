@@ -1,8 +1,8 @@
 #[cfg(not(loom))]
-use lazy_static::lazy_static;
+use lazy_static::lazy_static as lazy_static_loom;
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 #[cfg(loom)]
-use loom::lazy_static;
+use loom::lazy_static as lazy_static_loom;
 #[cfg(loom)]
 use loom::sync::RwLock;
 use std::collections::HashMap;
@@ -23,43 +23,76 @@ pub enum FileType {
     Symlink(String),                      // Contains the target path
 }
 
-lazy_static! {
-    static ref FS_TREE: RwLock<HashMap<String, FileType>> = {
-        let mut m = HashMap::new();
-        // Create directories and files based on the provided structure.
-        let mut rust_sandbox_dir = HashMap::new();
-        rust_sandbox_dir.insert(
-            "src".to_string(),
-            FileType::Directory({
-                let mut src_dir = HashMap::new();
-                src_dir.insert("credentials".to_string(), FileType::Regular("credentials content".to_string()));
-                src_dir.insert("noncredential".to_string(), FileType::Regular("noncredential content".to_string()));
-                src_dir.insert("symlink".to_string(), FileType::Symlink("/home/cs_gakusei/work/rust_sandbox/src/noncredential".to_string()));
-                src_dir
-            }),
-        );
-
-        m.insert(
-            "home".to_string(),
-            FileType::Directory({
-                let mut home_dir = HashMap::new();
-                home_dir.insert("cs_gakusei".to_string(), FileType::Directory({
-                    let mut cs_gakusei_dir = HashMap::new();
-                    cs_gakusei_dir.insert("work".to_string(), FileType::Directory({
-                        let mut work_dir = HashMap::new();
-                        work_dir.insert("rust_sandbox".to_string(), FileType::Directory(rust_sandbox_dir));
-                        work_dir
-                    }));
-                    cs_gakusei_dir
-                }));
-                home_dir
-            }),
-        );
-        RwLock::new(m)
-    };
-    static ref NEXT_FD: std::sync::RwLock<FileDescriptor> = std::sync::RwLock::new(3);  // start with 3
+lazy_static_loom! {
+    static ref FS_TREE: RwLock<HashMap<String, FileType>> = RwLock::new(HashMap::new());
+}
+lazy_static::lazy_static! {
+    static ref NEXT_FD: std::sync::RwLock<FileDescriptor> = std::sync::RwLock::new(3);
     static ref OPEN_FILES: std::sync::RwLock<HashMap<FileDescriptor, String>> = std::sync::RwLock::new(HashMap::new());
     static ref CURRENT_DIR: std::sync::RwLock<String> = std::sync::RwLock::new("/home/cs_gakusei/work/rust_sandbox".to_string());
+}
+
+pub fn initialize_mockfs() {
+    let mut m = HashMap::new();
+
+    // Create directories and files based on the provided structure.
+    let mut rust_sandbox_dir = HashMap::new();
+    rust_sandbox_dir.insert(
+        "src".to_string(),
+        FileType::Directory({
+            let mut src_dir = HashMap::new();
+            src_dir.insert(
+                "credentials".to_string(),
+                FileType::Regular("credentials content".to_string()),
+            );
+            src_dir.insert(
+                "noncredential".to_string(),
+                FileType::Regular("noncredential content".to_string()),
+            );
+            src_dir.insert(
+                "symlink".to_string(),
+                FileType::Symlink(
+                    "/home/cs_gakusei/work/rust_sandbox/src/noncredential".to_string(),
+                ),
+            );
+            src_dir
+        }),
+    );
+
+    m.insert(
+        "home".to_string(),
+        FileType::Directory({
+            let mut home_dir = HashMap::new();
+            home_dir.insert(
+                "cs_gakusei".to_string(),
+                FileType::Directory({
+                    let mut cs_gakusei_dir = HashMap::new();
+                    cs_gakusei_dir.insert(
+                        "work".to_string(),
+                        FileType::Directory({
+                            let mut work_dir = HashMap::new();
+                            work_dir.insert(
+                                "rust_sandbox".to_string(),
+                                FileType::Directory(rust_sandbox_dir),
+                            );
+                            work_dir
+                        }),
+                    );
+                    cs_gakusei_dir
+                }),
+            );
+            home_dir
+        }),
+    );
+
+    println!("initialize_mockfs: FS_TREE.write()");
+    let mut fs_tree = FS_TREE.write().unwrap();
+    *fs_tree = m;
+    let mut next_fd = NEXT_FD.write().unwrap();
+    *next_fd = 3;
+    OPEN_FILES.write().unwrap().clear();
+    let mut current_dir = CURRENT_DIR.write().unwrap();
+    *current_dir = "/home/cs_gakusei/work/rust_sandbox".to_string();
 }
 
 pub unsafe fn open(path: *const c_char, oflag: c_int) -> c_int {
@@ -89,7 +122,7 @@ pub unsafe fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_i
     let mut full_components: Vec<_> = base_path.split('/').filter(|&c| !c.is_empty()).collect();
     full_components.extend(components);
 
-    if traverse_path(&fs_tree_lock, &full_components).is_some() {
+    if let Some(file_type) = traverse_path(&fs_tree_lock, &full_components) {
         let mut fd = NEXT_FD.write().unwrap();
         let new_fd = *fd;
         *fd += 1;
@@ -117,25 +150,23 @@ pub unsafe fn readlinkat(
     println!("readlinkat({}): FS_TREE.read()", path);
     let fs_tree_lock = FS_TREE.read().unwrap();
     let open_files_lock = OPEN_FILES.read().unwrap();
+    let current_dir = CURRENT_DIR.read().unwrap();
 
     // Determine the starting point in the filesystem based on dirfd
-    let full_path: Vec<&str> = if dirfd == libc::AT_FDCWD {
-        components
+    let base_path = if path.starts_with("/") {
+        "".to_string()
+    } else if dirfd == libc::AT_FDCWD {
+        current_dir.to_string()
+    } else if let Some(dir_path) = open_files_lock.get(&dirfd) {
+        dir_path.clone()
     } else {
-        // We need to keep the lock guard in scope
-        if let Some(dir_path) = open_files_lock.get(&dirfd) {
-            // Combine the directory path with the provided pathname
-            let mut base_path: Vec<&str> = dir_path.split('/').filter(|&c| !c.is_empty()).collect();
-            base_path.extend(components);
-            base_path
-        } else {
-            // Invalid dirfd
-            return -1;
-        }
+        return -1;
     };
+    let mut full_components: Vec<_> = base_path.split('/').filter(|&c| !c.is_empty()).collect();
+    full_components.extend(components);
 
     // Resolve the symlink path within the filesystem tree starting from fs_tree
-    if let Some(FileType::Symlink(target_path)) = traverse_path(&fs_tree_lock, &full_path) {
+    if let Some(FileType::Regular(target_path)) = traverse_path(&fs_tree_lock, &full_components) {
         let bytes_to_copy = target_path.as_bytes().len().min(bufsz);
         for (i, byte) in target_path.as_bytes()[..bytes_to_copy].iter().enumerate() {
             *buf.add(i) = *byte as c_char;
@@ -220,43 +251,44 @@ impl AsDirectoryMut for FileType {
     }
 }
 
-// pub unsafe fn remove(filename: *const c_char) -> c_int {
-//     let path_str = CStr::from_ptr(filename).to_str().unwrap();
-//     let path_components = parse_path(path_str);
-//     let mut fs_tree_lock = FS_TREE.write().unwrap();
+pub unsafe fn remove(filename: *const c_char) -> c_int {
+    let path_str = CStr::from_ptr(filename).to_str().unwrap();
+    let path_components = parse_path(path_str);
+    println!("remove({}): FS_TREE.write()", path_str);
+    let mut fs_tree_lock = FS_TREE.write().unwrap();
 
-//     if path_components.is_empty() {
-//         return -1; // Invalid path
-//     }
+    if path_components.is_empty() {
+        return -1; // Invalid path
+    }
 
-//     let parent_path = if path_components.len() == 1 {
-//         vec![] // If the path has only one component, then its parent is the root.
-//     } else {
-//         path_components[..path_components.len() - 1].to_vec()
-//     };
+    let parent_path = if path_components.len() == 1 {
+        vec![] // If the path has only one component, then its parent is the root.
+    } else {
+        path_components[..path_components.len() - 1].to_vec()
+    };
 
-//     let file_name = path_components.last().unwrap();
+    let file_name = path_components.last().unwrap();
 
-//     if let Some(FileType::Directory(ref mut parent_dir)) =
-//         traverse_path_mut(&mut fs_tree_lock, &parent_path)
-//     {
-//         match parent_dir.get(*file_name) {
-//             Some(FileType::Directory(contents)) if contents.is_empty() => {
-//                 // Only allow removal of empty directories
-//                 parent_dir.remove(*file_name);
-//                 0 // Successfully removed
-//             }
-//             Some(FileType::Regular(_)) | Some(FileType::Symlink(_)) => {
-//                 // Remove file or symlink
-//                 parent_dir.remove(*file_name);
-//                 0 // Successfully removed
-//             }
-//             _ => -1, // Directory not empty or file not found
-//         }
-//     } else {
-//         -1 // Parent directory not found
-//     }
-// }
+    if let Some(FileType::Directory(ref mut parent_dir)) =
+        traverse_path_mut(&mut fs_tree_lock, &parent_path)
+    {
+        match parent_dir.get(*file_name) {
+            Some(FileType::Directory(contents)) if contents.is_empty() => {
+                // Only allow removal of empty directories
+                parent_dir.remove(*file_name);
+                0 // Successfully removed
+            }
+            Some(FileType::Regular(_)) | Some(FileType::Symlink(_)) => {
+                // Remove file or symlink
+                parent_dir.remove(*file_name);
+                0 // Successfully removed
+            }
+            _ => -1, // Directory not empty or file not found
+        }
+    } else {
+        -1 // Parent directory not found
+    }
+}
 
 pub unsafe fn link(src: *const c_char, dst: *const c_char) -> c_int {
     let src_str = CStr::from_ptr(src).to_str().unwrap();
@@ -333,6 +365,12 @@ fn traverse_path<'a>(
             Some(FileType::Directory(ref subdir)) => {
                 current = subdir;
             }
+            Some(FileType::Symlink(target_path)) => {
+                let target_components: Vec<&str> =
+                    target_path.split('/').filter(|&c| !c.is_empty()).collect();
+                let target_dir = &FS_TREE.read().unwrap(); // Assuming FS_TREE is a global RwLock
+                return traverse_path(target_dir, &target_components);
+            }
             Some(file_type) if &component == components.last().unwrap() => {
                 // Last component in path
                 return Some(file_type.clone());
@@ -343,25 +381,33 @@ fn traverse_path<'a>(
     Some(FileType::Directory(current.clone()))
 }
 
-// fn traverse_path_mut<'a>(
-//     current_dir: &'a mut HashMap<String, FileType>,
-//     components: &[&str],
-// ) -> Option<&'a mut FileType> {
-//     let mut current = current_dir;
-//     for &component in components {
-//         match current.get_mut(component) {
-//             Some(FileType::Directory(ref mut subdir)) => {
-//                 current = subdir;
-//             }
-//             Some(file_type) if &component == components.last().unwrap() => {
-//                 // Last component in path
-//                 return Some(file_type);
-//             }
-//             _ => return None,
-//         }
-//     }
-//     Some(&mut FileType::Directory(current.clone()))
-// }
+fn traverse_path_mut<'a>(
+    current_dir: &'a mut HashMap<String, FileType>,
+    components: &[&str],
+) -> Option<&'a mut FileType> {
+    let mut current = current_dir;
+    let path_len = components.len();
+
+    for (index, &component) in components.iter().enumerate() {
+        if let Some(next) = current.get_mut(component) {
+            if index == path_len - 1 {
+                return Some(next);
+            }
+
+            if let FileType::Directory(ref mut subdir) = next {
+                current = subdir;
+            } else {
+                // A non-directory component was found where a directory was expected
+                return None;
+            }
+        } else {
+            // Component not found
+            return None;
+        }
+    }
+
+    None
+}
 
 fn parse_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|&c| !c.is_empty()).collect()

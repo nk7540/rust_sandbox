@@ -3,8 +3,9 @@ use fs::read_link;
 #[cfg(not(feature = "mock"))]
 use libc::{link, open, openat, readlinkat, remove, unlink};
 mod mockfs;
+use mockfs::initialize_mockfs;
 #[cfg(feature = "mock")]
-use mockfs::{link, open, openat, read_link, readlinkat};
+use mockfs::{link, open, openat, read_link, readlinkat, remove};
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs as unix_fs;
@@ -113,6 +114,7 @@ fn safe_open(pathname: &str, mode: i32) -> Result<i32, OpenError> {
 }
 
 fn main() {
+    initialize_mockfs();
     let pathname = "src/symlink";
     let res = safe_open(NONCREDENTIAL, libc::O_RDONLY);
     match res {
@@ -137,6 +139,7 @@ mod tests {
 
         loom::model(|| {
             // replace the link so it points to another file denied to access
+            initialize_mockfs();
             let t1 = thread::spawn(|| {
                 // make sure that it does not allow the access to the newly-pointed file
                 let res = safe_open(NONCREDENTIAL, libc::O_RDONLY);
@@ -150,6 +153,7 @@ mod tests {
                 }
             });
             let t2 = thread::spawn(|| unsafe {
+                remove(CString::new(NONCREDENTIAL).unwrap().as_ptr());
                 link(
                     CString::new(CREDENTIALS).unwrap().as_ptr(),
                     CString::new(NONCREDENTIAL).unwrap().as_ptr(),
@@ -163,26 +167,44 @@ mod tests {
     #[test]
     fn test_unsafe_open() {
         // so that the noncredential file is not a symlink at first
-        fs::remove_file(NONCREDENTIAL);
-        fs::File::create(NONCREDENTIAL);
-        create_symlink(NONCREDENTIAL, SYMLINK);
+        // fs::remove_file(NONCREDENTIAL);
+        // fs::File::create(NONCREDENTIAL);
+        // create_symlink(NONCREDENTIAL, SYMLINK);
 
         loom::model(|| {
-            let t2 = thread::spawn(|| {
-                println!("unsafe_open: t2");
-                create_symlink(CREDENTIALS, NONCREDENTIAL);
-                // create_symlink(NONCREDENTIAL2, NONCREDENTIAL);
+            initialize_mockfs();
+            let t1 = thread::spawn(|| {
+                let target = match read_link(NONCREDENTIAL) {
+                    Ok(t) => t,
+                    Err(_) => Path::new(NONCREDENTIAL).to_path_buf(),
+                };
+                let target = target.to_str().unwrap();
+                println!("target: {:?}", target);
+                if target != CREDENTIALS {
+                    let fd =
+                        unsafe { open(CString::new(target).unwrap().as_ptr(), libc::O_RDONLY) };
+                    if fd == -1 {
+                        println!("open failed");
+                        return;
+                    }
+                    let fd_path = format!("/proc/self/fd/{}", fd);
+                    println!("unsafe_open: {}", fd_path);
+                    let pointed_path = read_link(&fd_path).unwrap().to_string_lossy().into_owned();
+                    println!("pointed_path: {}", pointed_path);
+                    assert_ne!(pointed_path, CREDENTIALS.to_string());
+                } else {
+                    println!("access denied");
+                }
             });
+            let t2 = thread::spawn(|| unsafe {
+                remove(CString::new(NONCREDENTIAL).unwrap().as_ptr());
+                link(
+                    CString::new(CREDENTIALS).unwrap().as_ptr(),
+                    CString::new(NONCREDENTIAL).unwrap().as_ptr(),
+                );
+            });
+            t1.join();
             t2.join();
-            let target = read_link(SYMLINK).unwrap();
-            let target = target.to_str().unwrap();
-            if target != CREDENTIALS {
-                let file = fs::File::open(target).unwrap(); // assume it's absolute
-                let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-                println!("unsafe_open: {}", fd_path);
-                let pointed_path = read_link(&fd_path).unwrap().to_string_lossy().into_owned();
-                assert_ne!(pointed_path, CREDENTIALS);
-            }
         })
     }
 
