@@ -1,3 +1,4 @@
+#![feature(local_key_cell_methods)]
 #[cfg(not(feature = "mock"))]
 use fs::read_link;
 #[cfg(not(feature = "mock"))]
@@ -115,8 +116,7 @@ fn safe_open(pathname: &str, mode: i32) -> Result<i32, OpenError> {
 
 fn main() {
     initialize_mockfs();
-    let pathname = "src/symlink";
-    let res = safe_open(NONCREDENTIAL, libc::O_RDONLY);
+    let res = safe_open(SYMLINK, libc::O_RDONLY);
     match res {
         Ok(fd) => println!("{}", fd),
         Err(OpenError::AccessDenied) => println!("denied"),
@@ -176,7 +176,10 @@ mod tests {
             let t1 = thread::spawn(|| {
                 let target = match read_link(NONCREDENTIAL) {
                     Ok(t) => t,
-                    Err(_) => Path::new(NONCREDENTIAL).to_path_buf(),
+                    Err(_) => {
+                        println!("path does not exist");
+                        return;
+                    }
                 };
                 let target = target.to_str().unwrap();
                 println!("target: {:?}", target);
